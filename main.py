@@ -2,6 +2,8 @@ from __future__ import print_function
 import os
 import argparse
 import shutil
+
+# from zmq import device
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,8 +12,10 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.autograd import Variable
 import models
-
-
+from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
+from torch.cuda.amp import autocast as autocast
+from torch.cuda.amp import GradScaler as GradScaler
+from utils import *
 # Training settings
 parser = argparse.ArgumentParser(description='PyTorch Slimming CIFAR training')
 parser.add_argument('--dataset', type=str, default='cifar100',
@@ -53,49 +57,22 @@ parser.add_argument('--depth', default=19, type=int,
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
-
+device = 'cpu'
 torch.manual_seed(args.seed)
 if args.cuda:
     torch.cuda.manual_seed(args.seed)
+    device = 'cuda'
 
 if not os.path.exists(args.save):
     os.makedirs(args.save)
 
-kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
 if args.dataset == 'cifar10':
-    train_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10('./data.cifar10', train=True, download=True,
-                       transform=transforms.Compose([
-                           transforms.Pad(4),
-                           transforms.RandomCrop(32),
-                           transforms.RandomHorizontalFlip(),
-                           transforms.ToTensor(),
-                           transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-                       ])),
-        batch_size=args.batch_size, shuffle=True, **kwargs)
-    test_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10('./data.cifar10', train=False, transform=transforms.Compose([
-                           transforms.ToTensor(),
-                           transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-                       ])),
-        batch_size=args.test_batch_size, shuffle=True, **kwargs)
+    data_loader = Cifar10DataLoader(batch_size = args.batch_size)
 else:
-    train_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR100('./data.cifar100', train=True, download=True,
-                       transform=transforms.Compose([
-                           transforms.Pad(4),
-                           transforms.RandomCrop(32),
-                           transforms.RandomHorizontalFlip(),
-                           transforms.ToTensor(),
-                           transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-                       ])),
-        batch_size=args.batch_size, shuffle=True, **kwargs)
-    test_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR100('./data.cifar100', train=False, transform=transforms.Compose([
-                           transforms.ToTensor(),
-                           transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-                       ])),
-        batch_size=args.test_batch_size, shuffle=True, **kwargs)
+    data_loader = Cifar100DataLoader(batch_size = args.batch_size)
+
+train_loader = data_loader['train']
+test_loader = data_loader['val']
 
 if args.refine:
     checkpoint = torch.load(args.refine)
@@ -105,9 +82,10 @@ else:
     model = models.__dict__[args.arch](dataset=args.dataset, depth=args.depth)
 
 if args.cuda:
-    model.cuda()
+    model.to(device)
 
 optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+scheduler = ReduceLROnPlateau(optimizer, 'min')
 
 if args.resume:
     if os.path.isfile(args.resume):
@@ -128,39 +106,53 @@ def updateBN():
         if isinstance(m, nn.BatchNorm2d):
             m.weight.grad.data.add_(args.s*torch.sign(m.weight.data))  # L1
 
-def train(epoch):
+def train(epoch, scaler):
     model.train()
+
+    for param_group in optimizer.param_groups:
+        cur_lr = param_group['lr']
+    print('learning_rate:', cur_lr)
+
     for batch_idx, (data, target) in enumerate(train_loader):
         if args.cuda:
-            data, target = data.cuda(), target.cuda()
-        data, target = Variable(data), Variable(target)
-        optimizer.zero_grad()
-        output = model(data)
-        loss = F.cross_entropy(output, target)
+            data, target = data.to(device), target.to(device)
+        # output = model(data)
+        # loss = F.cross_entropy(output, target)
+        # loss.backward()
+        # optimizer.step()
+
+        with autocast():
+            output = model(data)
+            loss = F.cross_entropy(output, target)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
         pred = output.data.max(1, keepdim=True)[1]
-        loss.backward()
         if args.sr:
             updateBN()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.1f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader), loss.data[0]))
+                100. * batch_idx / len(train_loader), loss.item()))
 
 def test():
     model.eval()
     test_loss = 0
     correct = 0
-    for data, target in test_loader:
-        if args.cuda:
-            data, target = data.cuda(), target.cuda()
-        data, target = Variable(data, volatile=True), Variable(target)
-        output = model(data)
-        test_loss += F.cross_entropy(output, target, size_average=False).data[0] # sum up batch loss
-        pred = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
-        correct += pred.eq(target.data.view_as(pred)).cpu().sum()
+    with torch.no_grad():
+        for data, target in test_loader:
+            if args.cuda:
+                data, target = data.to(device), target.to(device)
+            # data, target = Variable(data, volatile=True), Variable(target)
+            output = model(data)
+            test_loss += F.cross_entropy(output, target, reduction='sum').item() # sum up batch loss
+            pred = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
+            correct += pred.eq(target.data.view_as(pred)).cpu().sum()
 
     test_loss /= len(test_loader.dataset)
+    scheduler.step(test_loss)
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.1f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
@@ -171,12 +163,13 @@ def save_checkpoint(state, is_best, filepath):
     if is_best:
         shutil.copyfile(os.path.join(filepath, 'checkpoint.pth.tar'), os.path.join(filepath, 'model_best.pth.tar'))
 
+scaler = GradScaler()
 best_prec1 = 0.
 for epoch in range(args.start_epoch, args.epochs):
-    if epoch in [args.epochs*0.5, args.epochs*0.75]:
-        for param_group in optimizer.param_groups:
-            param_group['lr'] *= 0.1
-    train(epoch)
+    # if epoch in [args.epochs*0.5, args.epochs*0.75]:
+    #     for param_group in optimizer.param_groups:
+    #         param_group['lr'] *= 0.1
+    train(epoch, scaler)
     prec1 = test()
     is_best = prec1 > best_prec1
     best_prec1 = max(prec1, best_prec1)
