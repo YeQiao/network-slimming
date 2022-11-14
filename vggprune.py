@@ -17,6 +17,9 @@ from torch.cuda.amp import GradScaler as GradScaler
 from sklearn.cluster import KMeans
 from scipy.sparse import csc_matrix, csr_matrix
 import dill
+import warnings
+import copy
+from sklearn.exceptions import DataConversionWarning
 from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter('log_dir')
 
@@ -30,6 +33,7 @@ def train(args, model, epoch, train_loader, optimizer, device, scaler):
     for batch_idx, (data, target) in enumerate(train_loader):
         if args.cuda:
             data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
         # output = model(data)
         # loss = F.cross_entropy(output, target)
         # loss.backward()
@@ -43,7 +47,6 @@ def train(args, model, epoch, train_loader, optimizer, device, scaler):
         scaler.update()
 
         pred = output.data.max(1, keepdim=True)[1]
-        optimizer.step()
 
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.1f}%)]\tLoss: {:.6f}'.format(
@@ -67,7 +70,7 @@ def test(args, model, test_loader, device, scheduler = None):
     test_loss /= len(test_loader.dataset)
     if scheduler is not None:
         scheduler.step(test_loss)
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.1f}%)\n'.format(
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
     return correct / float(len(test_loader.dataset))
@@ -86,22 +89,57 @@ def save_checkpoint(model, state, is_best, filepath):
 
 def fine_tuning(args, model, train_loader,test_loader, device):
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, 'min')
+    # scheduler = ReduceLROnPlateau(optimizer, 'min')
+    scheduler = None
     scaler = GradScaler()
     best_prec1 = 0.
     for epoch in range(args.epochs):
+        if epoch in [args.epochs*0.35, args.epochs*0.6, args.epochs*0.85]:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= 0.1
+                
         train(args, model, epoch, train_loader, optimizer, device, scaler)
         prec1 = test(args, model, test_loader, device, scheduler)
         is_best = prec1 > best_prec1
-        best_model = model if is_best else best_model
+        best_model = copy.deepcopy(model) if is_best else best_model
         best_prec1 = max(prec1, best_prec1)
         save_checkpoint(model, {
             'epoch': epoch + 1,
             'state_dict': model.state_dict(),
             'best_prec1': best_prec1,
             'optimizer': optimizer.state_dict(),
-        }, is_best, filepath=args.save)
-    return best_model
+        }, is_best, filepath=args.Prune_save)
+    return best_model, best_prec1.item()
+
+def fine_tuning_Q(args, model, train_loader,test_loader, device):
+    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    # scheduler = ReduceLROnPlateau(optimizer, 'min')
+    scheduler = None
+    scaler = GradScaler()
+    best_prec1 = 0.
+    
+    for epoch in range(args.epochs):
+        if epoch in [args.epochs*0.35, args.epochs*0.6, args.epochs*0.85]:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= 0.1
+
+        train(args, model, epoch, train_loader, optimizer, device, scaler)
+
+        if epoch % args.quant_freq == 0:
+            print('----------Quantising-----------')
+            ws_quant(model, args.Conv_bits, args.Linear_bits, device)
+
+        prec1 = test(args, model, test_loader, device, scheduler)
+        is_best = prec1 > best_prec1
+        best_model = copy.deepcopy(model) if is_best else best_model
+        best_prec1 = max(prec1, best_prec1)
+        save_checkpoint(model, {
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_prec1': best_prec1,
+            'optimizer': optimizer.state_dict(),
+        }, is_best, filepath=args.Quant_save)
+    return best_model, best_prec1.item()
 
 def prune(args, model, test_loader, device):
 
@@ -159,7 +197,7 @@ def prune(args, model, test_loader, device):
         newmodel.cuda()
 
     num_parameters = sum([param.nelement() for param in newmodel.parameters()])
-    savepath = os.path.join(args.save, "prune.txt")
+    savepath = os.path.join(args.Prune_save, "prune.txt")
     with open(savepath, "w") as fp:
         fp.write("Configuration: \n"+str(cfg)+"\n")
         fp.write("Number of parameters: \n"+str(num_parameters)+"\n")
@@ -265,9 +303,9 @@ def prune(args, model, test_loader, device):
     bn_avg = []
     for m in model.modules():
         if isinstance(m, nn.BatchNorm2d):
-            bn_avg.append(m.weight.data.abs().mean())
+            bn_avg.append(m.weight.data.abs().mean().item())
     # print('factor is : ', bn.numpy())
-    print('factor is : ', bn_avg)
+    print('Avg bn factor is : ', bn_avg)
 
 
     # test(model)
@@ -279,10 +317,10 @@ def ws_quant(model, conv_bits, Linear_bits, device = "CUDA" if torch.cuda.is_ava
 
     for k, m in model.named_modules():
         if type(m).__name__ == 'Conv2d':
-            print("Quantizing conv layer : ", k)
+            # print("Quantizing conv layer : ", k)
             weight = m.weight.data.cpu().numpy()
             shape = weight.shape
-            print("weight shape: " ,weight.shape)
+            # print("weight shape: " ,weight.shape)
             # mat = csr_matrix(weight) if shape[0] < shape[1] else csc_matrix(weight)
             mat = weight
             min_ = np.min(mat.data)
@@ -291,13 +329,32 @@ def ws_quant(model, conv_bits, Linear_bits, device = "CUDA" if torch.cuda.is_ava
             # kmeans = KMeans(n_clusters=len(space), init=space.reshape(-1,1), n_init=1, precompute_distances=True, algorithm="full")
             kmeans = KMeans(n_clusters=len(space), init=space.reshape(-1,1), n_init=1, algorithm="full")
             # kmeans.fit(mat.data.reshape(-1,1))
-            kmeans.fit(np.reshape(mat.data,(-1,1)))
-            new_weight = kmeans.cluster_centers_[kmeans.labels_].reshape(-1)
-            mat.data = new_weight
-            m.weight.data = torch.from_numpy(mat).to(device)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                kmeans.fit(np.reshape(mat.data,(-1,1)))
+            new_weight = kmeans.cluster_centers_[kmeans.labels_].reshape(shape)
+            # print('weight shape: ', new_weight.shape)
+            # print('mat shape: ', mat.shape)
+            # mat.data = new_weight
+            # m.weight.data = torch.from_numpy(mat).to(device)
+
+            scaling_factor = torch.mean(torch.mean(torch.mean(abs(m.weight.data),dim=3,keepdim=True),dim=2,keepdim=True),dim=1,keepdim=True)
+            scaling_factor_q = torch.mean(torch.mean(torch.mean(abs(torch.from_numpy(new_weight).to(device)),dim=3,keepdim=True),dim=2,keepdim=True),dim=1,keepdim=True)
+            scaling_factor_diff = (scaling_factor - scaling_factor_q).view(-1,1,1,1)
+
+            # scaling_factor_diff = (scaling_factor / scaling_factor_q).view(-1,1,1,1)
+
+            # print(torch.from_numpy(new_weight).to(device).shape)
+            # print(scaling_factor_diff.shape)
+            # print('scaling factor difference: ',scaling_factor - scaling_factor_q)
+
+            # m.weight.data = torch.from_numpy(new_weight).to(device)
+
+            m.weight.data = torch.from_numpy(new_weight).to(device) + scaling_factor_diff
+            # m.weight.data = torch.mul(torch.from_numpy(new_weight).to(device), scaling_factor_diff)
         
         elif type(m).__name__ == 'Linear':
-            print("Quantizing Linear layer")
+            # print("Quantizing Linear layer")
             weight = m.weight.data.cpu().numpy()
             shape = weight.shape
             # mat = csr_matrix(weight) if shape[0] < shape[1] else csc_matrix(weight)
@@ -307,10 +364,40 @@ def ws_quant(model, conv_bits, Linear_bits, device = "CUDA" if torch.cuda.is_ava
             space = np.linspace(min_, max_, num=2**Linear_bits)
             kmeans = KMeans(n_clusters=len(space), init=space.reshape(-1,1), n_init=1, algorithm="full")
             # kmeans.fit(mat.data.reshape(-1,1))
-            kmeans.fit(np.reshape(mat.data,(-1,1)))
-            new_weight = kmeans.cluster_centers_[kmeans.labels_].reshape(-1)
-            mat.data = new_weight
-            m.weight.data = torch.from_numpy(mat).to(device)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                kmeans.fit(np.reshape(mat.data,(-1,1)))
+            new_weight = kmeans.cluster_centers_[kmeans.labels_].reshape(shape)
+            # mat.data = new_weight
+            # m.weight.data = torch.from_numpy(mat).to(device)
+            m.weight.data = torch.from_numpy(new_weight).to(device)
+
+def Cross_layer_ws_quant(args, model, conv_bits, Linear_bits, device = "CUDA" if torch.cuda.is_available() else "cpu"):
+
+    bn_avg = []
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            bn_avg.append(m.weight.data.abs().mean().item())
+    # print('factor is : ', bn.numpy())
+    print('Avg bn factor is : ', bn_avg)
+    
+    total = 0
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            total += m.weight.data.shape[0]
+
+    bn = torch.zeros(total)
+    index = 0
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            size = m.weight.data.shape[0]
+            bn[index:(index+size)] = m.weight.data.abs().clone()
+            index += size
+    # print('factor is : ', bn.numpy())
+    # print('factor is : ', bn_avg)
+    y, i = torch.sort(bn)
+    thre_index = int(total * args.percent)
+    thre = y[thre_index]
 
 
 def main():
@@ -324,6 +411,12 @@ def main():
                         help='input batch size for testing (default: 512)')
     parser.add_argument('--epochs', type=int, default=30, metavar='N',
                         help='number of epochs to train (default: 40)')
+    parser.add_argument('--quant_freq', type=int, default=1, metavar='N',
+                        help='Quantization frequency by epoch (default: 1)')
+    parser.add_argument('--Conv_bits', type=int, default=3, metavar='N',
+                        help='Bits number ofr Conv layer (default: 3)')
+    parser.add_argument('--Linear_bits', type=int, default=4, metavar='N',
+                        help='Bits number ofr Linear layer (default: 4)')
     parser.add_argument('--lr', type=float, default=0.05, metavar='LR',
                         help='learning rate (default: 0.05)')
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
@@ -342,12 +435,16 @@ def main():
                         help='random seed (default: 1)')
     parser.add_argument('--log-interval', type=int, default=100, metavar='N',
                         help='how many batches to wait before logging training status')
-    parser.add_argument('--save', default='./purned', type=str, metavar='PATH',
+    parser.add_argument('--Prune_save', default='./purned', type=str, metavar='PATH',
                         help='path to save prune model (default: ./purned)')
+    parser.add_argument('--Quant_save', default='./quantized', type=str, metavar='PATH',
+                        help='path to save quantized model (default: ./quantized)')
     parser.add_argument('--refine', action=argparse.BooleanOptionalAction, metavar='T',
                         help='weather to fine tuning the model')
     parser.add_argument('--quant', action=argparse.BooleanOptionalAction, metavar='T',
                         help='weather to quantize the model')
+    parser.add_argument('--refine_quant', action=argparse.BooleanOptionalAction, metavar='T',
+                        help='weather to fine tuning quantize the model')
     parser.add_argument('--plot_hist', action=argparse.BooleanOptionalAction, metavar='T',
                         help='weather to plot the Histogram')
     args = parser.parse_args()
@@ -359,8 +456,10 @@ def main():
         torch.cuda.manual_seed(args.seed)
         device = 'cuda'
 
-    if not os.path.exists(args.save):
-        os.makedirs(args.save)
+    if not os.path.exists(args.Prune_save):
+        os.makedirs(args.Prune_save)
+    if not os.path.exists(args.Quant_save):
+        os.makedirs(args.Quant_save)
 
     model = vgg(dataset=args.dataset, depth=args.depth).to(device)
 
@@ -385,22 +484,31 @@ def main():
             print("=> no checkpoint found at '{}'".format(args.model))
 
     test(args, model, test_loader, device)
-
+    warnings.filterwarnings(action='ignore', category=DataConversionWarning)
     print('Start Model Purning')
     model = prune(args, model, test_loader, device)
     print('Model Purning Successful!')
     best_model = model
     if args.refine:
-        print('----------Start Fine Tuning-----------')
-        best_model = fine_tuning(args, model, train_loader,test_loader, device)
+        print('----------Start Fine Tuning after Purning-----------')
+        best_model, best_prec1_p = fine_tuning(args, model, train_loader,test_loader, device)
         test(args, best_model, test_loader, device)
-        print('----------Fine Tuning Finished-----------')
+        print('----------Fine Tuning_P Finished-----------')
+        print('Final ACC after Pruning_fine_turning: {:.2f}%'.format(100*best_prec1_p))
 
-    if args.quant:
-        print('----------Start Quantization-----------')
-        ws_quant(best_model, 4, 5, device)
+    if args.quant and not args.refine_quant:
+        print('----------Start Quantization without Fine Tuning -----------')
+        ws_quant(best_model, args.Conv_bits, args.Linear_bits, device)
         test(args, best_model, test_loader, device)
         print('----------Quantization Finished-----------')
+
+    if args.quant and args.refine_quant:
+        print('----------Start Quantization with Fine Tuning -----------')
+        ws_quant(best_model, args.Conv_bits, args.Linear_bits, device)
+        best_model_q, best_prec1_q = fine_tuning_Q(args, best_model, train_loader,test_loader, device)
+        test(args, best_model_q, test_loader, device)
+        print('----------Fine Tuning_Q Finished-----------')
+        print('Final ACC after Pruning_Quant_fine_turning: {:.2f}%'.format(100*best_prec1_q))
         
     if args.plot_hist:
         plot_hist_conv_linear(best_model,save_fig=True,plt_show=True,model_name=None)

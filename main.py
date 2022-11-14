@@ -85,7 +85,9 @@ if args.cuda:
     model.to(device)
 
 optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-scheduler = ReduceLROnPlateau(optimizer, 'min')
+# optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0)
+# optimizer = torch.optim.Adam(model.parameters(), lr = args.lr, weight_decay = 0)
+# scheduler = ReduceLROnPlateau(optimizer, factor = 0.3, cooldown = 5)
 
 if args.resume:
     if os.path.isfile(args.resume):
@@ -116,6 +118,7 @@ def train(epoch, scaler):
     for batch_idx, (data, target) in enumerate(train_loader):
         if args.cuda:
             data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
         # output = model(data)
         # loss = F.cross_entropy(output, target)
         # loss.backward()
@@ -152,7 +155,7 @@ def test():
             correct += pred.eq(target.data.view_as(pred)).cpu().sum()
 
     test_loss /= len(test_loader.dataset)
-    scheduler.step(test_loss)
+    # scheduler.step(test_loss)
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.1f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
@@ -166,9 +169,11 @@ def save_checkpoint(state, is_best, filepath):
 scaler = GradScaler()
 best_prec1 = 0.
 for epoch in range(args.start_epoch, args.epochs):
-    # if epoch in [args.epochs*0.5, args.epochs*0.75]:
-    #     for param_group in optimizer.param_groups:
-    #         param_group['lr'] *= 0.1
+
+    if epoch in [args.epochs*0.3, args.epochs*0.6, args.epochs*0.85]:
+        for param_group in optimizer.param_groups:
+            param_group['lr'] *= 0.1
+
     train(epoch, scaler)
     prec1 = test()
     is_best = prec1 > best_prec1
